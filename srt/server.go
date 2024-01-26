@@ -6,22 +6,21 @@ import "C"
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"runtime"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/haivision/srtgo"
 	"github.com/voc/srtrelay/auth"
 	"github.com/voc/srtrelay/format"
 	"github.com/voc/srtrelay/relay"
 	"github.com/voc/srtrelay/stream"
-)
-
-const (
-	// Make this configurable? max is 1456
-	PacketSize = 1316 // TS_UDP_LEN
 )
 
 type Config struct {
@@ -33,10 +32,10 @@ type ServerConfig struct {
 	Addresses     []string
 	PublicAddress string
 	Latency       uint
-	ListenTimeout uint
 	LossMaxTTL    uint
 	Auth          auth.Authenticator
 	SyncClients   bool
+	ListenBacklog int
 }
 
 // Server is an interface for a srt relay server
@@ -56,15 +55,18 @@ type ServerImpl struct {
 	mutex sync.Mutex
 	conns map[*srtConn]bool
 	done  sync.WaitGroup
+
+	pool *sync.Pool
 }
 
 // NewServer creates a server
-func NewServer(config *Config) Server {
+func NewServer(config *Config) *ServerImpl {
 	r := relay.NewRelay(&config.Relay)
 	return &ServerImpl{
 		relay:  r,
 		config: &config.Server,
 		conns:  make(map[*srtConn]bool),
+		pool:   newBufferPool(config.Relay.PacketSize),
 	}
 }
 
@@ -120,7 +122,9 @@ func (s *ServerImpl) listenCallback(socket *srtgo.SrtSocket, version int, addr *
 	// Check authentication
 	if !s.config.Auth.Authenticate(streamid) {
 		log.Printf("%s - Stream '%s' access denied\n", addr, streamid)
-		socket.SetRejectReason(srtgo.RejectionReasonUnauthorized)
+		if err := socket.SetRejectReason(srtgo.RejectionReasonUnauthorized); err != nil {
+			log.Printf("Error rejecting stream: %s", err)
+		}
 		return false
 	}
 
@@ -131,30 +135,36 @@ func (s *ServerImpl) listenAt(ctx context.Context, host string, port uint16) err
 	options := make(map[string]string)
 	options["blocking"] = "0"
 	options["transtype"] = "live"
-	options["listen_timeout"] = strconv.Itoa(int(s.config.ListenTimeout))
 	options["latency"] = strconv.Itoa(int(s.config.Latency))
 
 	sck := srtgo.NewSrtSocket(host, port, options)
-	sck.SetSockOptInt(srtgo.SRTO_LOSSMAXTTL, int(s.config.LossMaxTTL))
+	if err := sck.SetSockOptInt(srtgo.SRTO_LOSSMAXTTL, int(s.config.LossMaxTTL)); err != nil {
+		log.Printf("Error settings lossmaxttl: %s", err)
+	}
 	sck.SetListenCallback(s.listenCallback)
-	err := sck.Listen(5)
+	err := sck.Listen(s.config.ListenBacklog)
 	if err != nil {
 		return fmt.Errorf("Listen failed for %v:%v : %v", host, port, err)
 	}
 
-	s.done.Add(1)
+	s.done.Add(2)
+	// server socket closer
 	go func() {
 		defer s.done.Done()
 		<-ctx.Done()
 		sck.Close()
 	}()
 
-	s.done.Add(1)
+	// accept loop
 	go func() {
 		defer s.done.Done()
 		for {
+			sck.SetReadDeadline(time.Now().Add(time.Millisecond * 300))
 			sock, addr, err := sck.Accept()
 			if err != nil {
+				if errors.Is(err, &srtgo.SrtEpollTimeout{}) {
+					continue
+				}
 				// exit silently if context closed
 				select {
 				case <-ctx.Done():
@@ -162,6 +172,7 @@ func (s *ServerImpl) listenAt(ctx context.Context, host string, port uint16) err
 				default:
 				}
 				log.Println("accept failed", err)
+				continue
 			}
 			go s.Handle(ctx, sock, addr)
 		}
@@ -171,9 +182,16 @@ func (s *ServerImpl) listenAt(ctx context.Context, host string, port uint16) err
 
 // SRTConn wraps an srtsocket with additional state
 type srtConn struct {
-	socket   *srtgo.SrtSocket
-	address  *net.UDPAddr
+	socket   relaySocket
+	address  string
 	streamid *stream.StreamID
+}
+
+type relaySocket interface {
+	io.Reader
+	io.Writer
+	Close()
+	Stats() (*srtgo.SrtStats, error)
 }
 
 // Handle srt client connection
@@ -195,7 +213,7 @@ func (s *ServerImpl) Handle(ctx context.Context, sock *srtgo.SrtSocket, addr *ne
 
 	conn := &srtConn{
 		socket:   sock,
-		address:  addr,
+		address:  addr.String(),
 		streamid: &streamid,
 	}
 
@@ -239,7 +257,7 @@ func (s *ServerImpl) play(conn *srtConn) error {
 			return nil
 		}
 
-		// Find synchronization pointinitial
+		// Find initial synchronization point
 		// TODO: implement timeout for sync
 		if !playing {
 			init, err := demux.FindInit(buf)
@@ -248,7 +266,10 @@ func (s *ServerImpl) play(conn *srtConn) error {
 			} else if init != nil {
 				for i := range init {
 					buf := init[i]
-					conn.socket.Write(buf)
+					_, err := conn.socket.Write(buf)
+					if err != nil {
+						return err
+					}
 				}
 				playing = true
 			}
@@ -273,20 +294,22 @@ func (s *ServerImpl) publish(conn *srtConn) error {
 	log.Printf("%s - publish %s\n", conn.address, conn.streamid.Name())
 
 	for {
+		// Get buffer from pool and return sometime after use
+		buf := s.pool.Get().(*[]byte)
+		runtime.SetFinalizer(buf, func(buf *[]byte) {
+			s.pool.Put(buf)
+		})
+
+		n, err := conn.socket.Read(*buf)
+
 		// Push read buffers to all clients via the publish channel
-		// a ringbuffer would probably be more efficient
-		buf := make([]byte, PacketSize)
-		n, err := conn.socket.Read(buf)
+		if n > 0 {
+			pub <- (*buf)[:n]
+		}
+
 		if err != nil {
 			return err
 		}
-
-		// handle EOF
-		if n == 0 {
-			return nil
-		}
-
-		pub <- buf[:n]
 	}
 }
 
@@ -332,7 +355,7 @@ func (s *ServerImpl) GetSocketStatistics() []*SocketStatistics {
 			continue
 		}
 		statistics = append(statistics, &SocketStatistics{
-			Address:  conn.address.String(),
+			Address:  conn.address,
 			StreamID: conn.streamid.String(),
 			Stats:    srtStats,
 		})
